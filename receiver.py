@@ -1,20 +1,19 @@
 import os
 import redis
+import json
 from flask import Flask, request, abort
 
 app = Flask(__name__)
 
-# This is the magic part:
-# Railway will automatically find your Redis database in the same project
-# and put its connection URL into an environment variable called "REDIS_URL".
+# This will get the REDIS_URL you set in your Railway variables
 REDIS_URL = os.environ.get("REDIS_URL")
 if not REDIS_URL:
-    print("FATAL: REDIS_URL is not set. Is Redis provisioned in this project?")
-    # In a real app, you'd exit, but for deployment this is fine
+    print("FATAL: REDIS_URL is not set. Check your Railway variables.")
     
 try:
     # Connect to your Redis mailbox
     r = redis.from_url(REDIS_URL, decode_responses=True)
+    r.ping() # Test the connection
     print("Successfully connected to Redis.")
 except Exception as e:
     print(f"Error connecting to Redis: {e}")
@@ -32,24 +31,41 @@ def webhook_listener():
         abort(500, description="Redis connection is not available.")
         
     try:
-        data = request.json
-        if not data:
-            print("Received empty or non-JSON request")
-            abort(400, description="Request must be JSON.")
+        # 1. Get the raw text from the alert
+        # (TradingView's alert() function sends raw text, not JSON)
+        raw_data = request.get_data(as_text=True)
+        if not raw_data:
+            print("Received empty request")
+            abort(400, "Request is empty.")
+        
+        try:
+            # 2. Parse the raw text string into a Python dictionary
+            data = json.loads(raw_data)
+        except json.JSONDecodeError:
+            print(f"Invalid JSON received: {raw_data}")
+            abort(400, "Request is not valid JSON.")
 
-        ticker = data.get('ticker')
-        color = data.get('color')
-
-        if not ticker or not color:
-            print(f"Invalid data received: {data}")
-            abort(400, description="Missing 'ticker' or 'color' in payload.")
-
-        # This is the core logic:
-        # It sets the 'ticker' (e.g., "BUMI") to the 'color' value (e.g., "Red")
-        r.set(ticker, color)
-
-        print(f"SUCCESS: Set {ticker} -> {color}")
-        return "Signal received successfully", 200
+        # 'data' is now: {"IDX:BUMI": "Red", "IDX:DEWA": "Green", ...}
+        
+        # Use a Redis pipeline for super-fast, efficient updates
+        pipeline = r.pipeline()
+        for ticker_with_prefix, color_from_tv in data.items():
+            
+            # 3. Strip "IDX:" prefix to get the simple ticker (e.g., "BUMI")
+            simple_ticker = ticker_with_prefix.split(":")[-1] 
+            
+            # 4. Clean up the color (e.g., "green" -> "Green")
+            final_color = color_from_tv.lower().capitalize()
+            
+            # 5. Save all 3 colors ("Green", "Red", "Yellow") to Redis
+            pipeline.set(simple_ticker, final_color)
+            print(f"Queueing update: {simple_ticker} -> {final_color}")
+        
+        # 6. Execute all updates at once
+        pipeline.execute()
+        
+        print(f"SUCCESS: Updated {len(data)} tickers from one alert.")
+        return "Signals received successfully", 200
 
     except Exception as e:
         print(f"An error occurred processing the webhook: {e}")
